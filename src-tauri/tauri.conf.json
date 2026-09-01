@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Codex Account Switcher",
+  "version": "2.1.2",
+  "identifier": "dev.a123.codex-account-switcher",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{ "title": "Codex Account Switcher", "width": 980, "height": 680, "minWidth": 760, "minHeight": 540, "center": true }],
+    "security": { "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "macOS": { "signingIdentity": "-" },
+    "shortDescription": "Switch and validate Codex accounts",
+    "longDescription": "Cross-platform Codex account manager with secure KeyCrop purchase synchronization."
+  }
+}

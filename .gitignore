@@ -1,0 +1,29 @@
+/node_modules/
+/dist/
+/src-tauri/target/
+.DS_Store
+
+# Local secrets and account data
+.env
+.env.*
+!.env.example
+**/auth.json
+**/profiles.json
+**/account-switcher/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local builds, logs and editor state
+*.dmg
+*.app
+*.msi
+*.exe
+*.AppImage
+*.deb
+*.rpm
+*.log
+.idea/
+.vscode/
+coverage/
