@@ -70,6 +70,7 @@ struct KeyCropSyncResult {
     imported: usize,
     duplicates: usize,
     captured: usize,
+    recovered: usize,
     rejected: usize,
 }
 
@@ -340,6 +341,56 @@ fn is_duplicate(paths: &Paths, profiles: &[Profile], candidate: &Value) -> AppRe
         }
     }
     Ok(false)
+}
+
+fn matching_profile(
+    paths: &Paths,
+    profiles: &[Profile],
+    candidate: &Value,
+) -> AppResult<Option<(Profile, Value)>> {
+    let candidate_id = identity(candidate);
+    let candidate_json = canonical(candidate);
+    for profile in profiles {
+        let saved = profile_value(paths, profile)?;
+        if (candidate_id.is_some() && identity(&saved) == candidate_id)
+            || canonical(&saved) == candidate_json
+        {
+            return Ok(Some((profile.clone(), saved)));
+        }
+    }
+    Ok(None)
+}
+
+fn has_refresh_token(value: &Value) -> bool {
+    value
+        .pointer("/tokens/refresh_token")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.is_empty())
+}
+
+fn replace_profile_auth(
+    paths: &Paths,
+    profiles: &[Profile],
+    profile: &Profile,
+    original: &Value,
+    replacement: &Value,
+) -> AppResult<()> {
+    let was_active = detect_active(paths, profiles) == Some(profile.id);
+    let original_bytes = serde_json::to_vec_pretty(original).map_err(error_string)?;
+    let replacement_bytes = serde_json::to_vec_pretty(replacement).map_err(error_string)?;
+    secure_write(
+        &paths.backups.join(format!(
+            "keycrop_recovery_{}_{}.json",
+            profile.id,
+            Utc::now().format("%Y-%m-%d_%H-%M-%S-%3f")
+        )),
+        &original_bytes,
+    )?;
+    secure_write(&paths.profiles.join(&profile.file_name), &replacement_bytes)?;
+    if was_active {
+        secure_write(&paths.auth, &replacement_bytes)?;
+    }
+    Ok(())
 }
 
 fn suggested_name(value: &Value, fallback: &str) -> String {
@@ -1141,10 +1192,28 @@ async fn keycrop_sync_accounts() -> AppResult<KeyCropSyncResult> {
     let mut imported = 0;
     let mut duplicates = 0;
     let mut captured = 0;
+    let mut recovered = 0;
     let mut rejected = 0;
     for (index, candidate) in candidates.into_iter().enumerate() {
-        if is_duplicate(&paths, &profiles, &candidate)? {
-            duplicates += 1;
+        if let Some((profile, saved)) = matching_profile(&paths, &profiles, &candidate)? {
+            if has_refresh_token(&saved) || !has_refresh_token(&candidate) {
+                duplicates += 1;
+                continue;
+            }
+            let rotated = tauri::async_runtime::spawn_blocking(move || {
+                let mut candidate = candidate;
+                refresh_auth_value_locked(&mut candidate).map(|_| candidate)
+            })
+            .await
+            .map_err(error_string)?;
+            match rotated {
+                Ok(rotated) => {
+                    replace_profile_auth(&paths, &profiles, &profile, &saved, &rotated)?;
+                    captured += 1;
+                    recovered += 1;
+                }
+                Err(_) => rejected += 1,
+            }
             continue;
         }
         let rotated = tauri::async_runtime::spawn_blocking(move || {
@@ -1171,6 +1240,7 @@ async fn keycrop_sync_accounts() -> AppResult<KeyCropSyncResult> {
         imported,
         duplicates,
         captured,
+        recovered,
         rejected,
     })
 }
@@ -1186,7 +1256,9 @@ fn looks_like_codex_auth(value: &Value) -> bool {
 
 fn collect_auth_values(value: &Value, found: &mut Vec<Value>, seen: &mut HashSet<String>) {
     if looks_like_codex_auth(value) {
-        let key = identity(value).unwrap_or_else(|| canonical(value));
+        // Одинаковые снимки убираем, но разные token-пары одного аккаунта
+        // сохраняем: более свежая пара может восстановить профиль без refresh.
+        let key = canonical(value);
         if seen.insert(key) {
             found.push(value.clone());
         }
@@ -1780,6 +1852,32 @@ mod tests {
             Some("still-working")
         );
         assert!(auth.pointer("/tokens/refresh_token").is_none());
+    }
+
+    #[test]
+    fn keycrop_keeps_new_token_pairs_for_the_same_account() {
+        let payload = json!([
+            {
+                "tokens": {
+                    "account_id": "acc_same",
+                    "access_token": "access_old",
+                    "refresh_token": "refresh_old"
+                }
+            },
+            {
+                "tokens": {
+                    "account_id": "acc_same",
+                    "access_token": "access_new",
+                    "refresh_token": "refresh_new"
+                }
+            }
+        ]);
+        let mut found = Vec::new();
+        let mut seen = HashSet::new();
+
+        collect_auth_values(&payload, &mut found, &mut seen);
+
+        assert_eq!(found.len(), 2);
     }
 
     #[test]

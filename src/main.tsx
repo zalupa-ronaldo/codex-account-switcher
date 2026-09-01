@@ -106,6 +106,7 @@ if (
         imported: 0,
         duplicates: 4,
         captured: 0,
+        recovered: 0,
         rejected: 0,
       };
     if (command === "probe_rate_limits") return rates[args.profileId];

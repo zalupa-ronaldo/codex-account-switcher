@@ -1,6 +1,6 @@
 [package]
 name = "codex-account-switcher"
-version = "2.2.1"
+version = "2.2.2"
 description = "Cross-platform Codex account manager with KeyCrop sync"
 authors = ["a123"]
 edition = "2021"

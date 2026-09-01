@@ -36,6 +36,7 @@ type SyncResult = {
   imported: number;
   duplicates: number;
   captured: number;
+  recovered: number;
   rejected: number;
 };
 type SyncPhase = "idle" | "keycrop" | "limits";
@@ -245,11 +246,13 @@ export default function App() {
         next = await reload();
         setNotice({
           kind: "ok",
-          text: result.imported
-            ? `Добавлено и перехвачено: ${result.captured}`
-            : result.rejected
-              ? `Новых рабочих аккаунтов нет · отклонено: ${result.rejected}`
-              : "Аккаунты синхронизированы",
+          text: result.recovered
+            ? `Восстановлено аккаунтов: ${result.recovered}`
+            : result.imported
+              ? `Добавлено и перехвачено: ${result.captured}`
+              : result.rejected
+                ? `Новых рабочих аккаунтов нет · отклонено: ${result.rejected}`
+                : "Аккаунты синхронизированы",
         });
       }
       if (next) await refreshLimits(next.profiles);
