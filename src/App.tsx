@@ -5,17 +5,29 @@ import {
   Check,
   ChevronRight,
   Cookie,
+  CreditCard,
+  Globe2,
   Info,
+  KeyRound,
   LoaderCircle,
   Plus,
   RefreshCw,
   Settings,
+  ShieldCheck,
   Trash2,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import keycropMark from "./assets/keycrop-mark.webp";
-import type { AppSnapshot, KeyCropStatus, Profile, RateLimit } from "./types";
+import type {
+  AccountLiveInfo,
+  AppSnapshot,
+  BrokerStatus,
+  KeyCropStatus,
+  Profile,
+  RateLimit,
+  TokenStatus,
+} from "./types";
 
 type Notice = { kind: "ok" | "error"; text: string } | null;
 type SyncResult = {
@@ -23,6 +35,8 @@ type SyncResult = {
   accountsFound: number;
   imported: number;
   duplicates: number;
+  captured: number;
+  rejected: number;
 };
 type SyncPhase = "idle" | "keycrop" | "limits";
 type ProbeResult = "ok" | "expired" | "error";
@@ -45,6 +59,16 @@ function isExpiredAuth(error: unknown) {
   ].some((marker) => message.includes(marker));
 }
 
+function isInvalidRefresh(error: unknown) {
+  const message = String(error).toLowerCase();
+  return (
+    message.includes("refresh token недействителен") ||
+    message.includes("invalid_refresh_token") ||
+    message.includes("refresh_token_reused") ||
+    message.includes("refresh token was already used")
+  );
+}
+
 export default function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
   const [keycrop, setKeycrop] = useState<KeyCropStatus | null>(null);
@@ -56,6 +80,16 @@ export default function App() {
   const [notice, setNotice] = useState<Notice>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedProfile, setSelectedProfile] = useState<Profile | null>(null);
+  const [tokenStatuses, setTokenStatuses] = useState<
+    Record<string, TokenStatus>
+  >({});
+  const [liveInfo, setLiveInfo] = useState<Record<string, AccountLiveInfo>>({});
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [refreshingTokenId, setRefreshingTokenId] = useState<string | null>(
+    null,
+  );
+  const [broker, setBroker] = useState<BrokerStatus | null>(null);
+  const [configuringBroker, setConfiguringBroker] = useState(false);
   const [cookie, setCookie] = useState("");
   const [profileName, setProfileName] = useState("");
   const [profileJson, setProfileJson] = useState("");
@@ -159,6 +193,48 @@ export default function App() {
     return () => window.clearTimeout(timeout);
   }, [notice]);
 
+  useEffect(() => {
+    void invoke<BrokerStatus>("broker_status")
+      .then(setBroker)
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!selectedProfile) return;
+    let cancelled = false;
+    setDetailsLoading(true);
+    void Promise.allSettled([
+      invoke<TokenStatus>("profile_token_status", {
+        profileId: selectedProfile.id,
+      }),
+      invoke<AccountLiveInfo>("account_live_info", {
+        profileId: selectedProfile.id,
+      }),
+    ]).then(([tokenResult, liveResult]) => {
+      if (cancelled) return;
+      if (tokenResult.status === "fulfilled") {
+        setTokenStatuses((current) => ({
+          ...current,
+          [selectedProfile.id]: tokenResult.value,
+        }));
+      }
+      if (liveResult.status === "fulfilled") {
+        setLiveInfo((current) => ({
+          ...current,
+          [selectedProfile.id]: liveResult.value,
+        }));
+        setTokenStatuses((current) => ({
+          ...current,
+          [selectedProfile.id]: liveResult.value.token,
+        }));
+      }
+      setDetailsLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProfile]);
+
   async function syncAll() {
     if (syncPhase !== "idle") return;
     try {
@@ -170,8 +246,10 @@ export default function App() {
         setNotice({
           kind: "ok",
           text: result.imported
-            ? `Добавлено аккаунтов: ${result.imported}`
-            : "Аккаунты синхронизированы",
+            ? `Добавлено и перехвачено: ${result.captured}`
+            : result.rejected
+              ? `Новых рабочих аккаунтов нет · отклонено: ${result.rejected}`
+              : "Аккаунты синхронизированы",
         });
       }
       if (next) await refreshLimits(next.profiles);
@@ -195,6 +273,72 @@ export default function App() {
     }
   }
 
+  async function refreshToken(profile: Profile) {
+    if (refreshingTokenId) return;
+    setRefreshingTokenId(profile.id);
+    try {
+      const status = await invoke<TokenStatus>("refresh_profile", {
+        profileId: profile.id,
+      });
+      setTokenStatuses((current) => ({ ...current, [profile.id]: status }));
+      const info = await invoke<AccountLiveInfo>("account_live_info", {
+        profileId: profile.id,
+      }).catch(() => null);
+      if (info) setLiveInfo((current) => ({ ...current, [profile.id]: info }));
+      await probeProfile(profile);
+      setNotice({ kind: "ok", text: "Токены обновлены и сохранены" });
+    } catch (error) {
+      if (isInvalidRefresh(error)) {
+        const status = await invoke<TokenStatus>("profile_token_status", {
+          profileId: profile.id,
+        });
+        setTokenStatuses((current) => ({ ...current, [profile.id]: status }));
+        if (status.accessSecondsLeft <= 0) {
+          await invoke("delete_profile", { profileId: profile.id });
+          await reload();
+          setSelectedProfile(null);
+          setNotice({
+            kind: "error",
+            text: "Access и refresh истекли · профиль удалён",
+          });
+        } else {
+          setNotice({
+            kind: "error",
+            text: `Refresh недействителен · access продолжит работать ещё ${formatLifetime(status.accessSecondsLeft)}`,
+          });
+        }
+      } else if (isExpiredAuth(error)) {
+        await invoke("delete_profile", { profileId: profile.id });
+        await reload();
+        setSelectedProfile(null);
+        setNotice({
+          kind: "error",
+          text: "Авторизация истекла · профиль удалён",
+        });
+      } else {
+        setNotice({ kind: "error", text: String(error) });
+      }
+    } finally {
+      setRefreshingTokenId(null);
+    }
+  }
+
+  async function enableBroker() {
+    setConfiguringBroker(true);
+    try {
+      const status = await invoke<BrokerStatus>("configure_broker");
+      setBroker(status);
+      setNotice({
+        kind: "ok",
+        text: "Broker подключён · перезапусти Codex",
+      });
+    } catch (error) {
+      setNotice({ kind: "error", text: String(error) });
+    } finally {
+      setConfiguringBroker(false);
+    }
+  }
+
   async function connectKeyCrop() {
     if (!cookie.trim()) return;
     setSaving(true);
@@ -209,8 +353,10 @@ export default function App() {
       setNotice({
         kind: "ok",
         text: result.imported
-          ? `KeyCrop подключён · добавлено ${result.imported}`
-          : "KeyCrop подключён",
+          ? `KeyCrop подключён · перехвачено ${result.captured}`
+          : result.rejected
+            ? `KeyCrop подключён · отклонено ${result.rejected}`
+            : "KeyCrop подключён",
       });
       await refreshLimits(next.profiles);
     } catch (error) {
@@ -231,7 +377,7 @@ export default function App() {
       setProfileName("");
       setProfileJson("");
       const next = await reload();
-      setNotice({ kind: "ok", text: "Профиль добавлен" });
+      setNotice({ kind: "ok", text: "Профиль добавлен · refresh перехвачен" });
       const added = next.profiles.at(-1);
       if (added) await refreshLimits([added]);
     } catch (error) {
@@ -397,9 +543,14 @@ export default function App() {
             error={rateErrors[selectedProfile.id]}
             active={selectedProfile.id === snapshot?.activeId}
             loading={checkingId === selectedProfile.id}
+            detailsLoading={detailsLoading}
             activating={activatingId === selectedProfile.id}
+            refreshingToken={refreshingTokenId === selectedProfile.id}
+            token={tokenStatuses[selectedProfile.id]}
+            live={liveInfo[selectedProfile.id]}
             onClose={() => setSelectedProfile(null)}
             onRefresh={() => refreshLimits([selectedProfile])}
+            onRefreshToken={() => refreshToken(selectedProfile)}
             onActivate={() => activate(selectedProfile)}
           />
         </div>
@@ -426,6 +577,42 @@ export default function App() {
               </button>
             </div>
             <div className="settings-scroll">
+              <div className="settings-section">
+                <div className="section-copy broker-copy">
+                  <ShieldCheck size={18} />
+                  <span>
+                    <b>Refresh Broker</b>
+                    <small>
+                      {broker?.running
+                        ? broker.configured
+                          ? "Работает и подключён к Codex"
+                          : "Работает · нужно подключить к Codex"
+                        : broker?.error || "Запускается локально на 127.0.0.1"}
+                    </small>
+                  </span>
+                  <i className={broker?.running ? "online" : ""} />
+                </div>
+                <div className="broker-line">
+                  <code>
+                    {broker?.url || "http://127.0.0.1:1456/oauth/token"}
+                  </code>
+                  <button
+                    className="primary"
+                    disabled={configuringBroker || broker?.configured}
+                    onClick={enableBroker}
+                  >
+                    {configuringBroker && (
+                      <LoaderCircle className="spin" size={14} />
+                    )}
+                    {broker?.configured ? "Подключён" : "Подключить"}
+                  </button>
+                </div>
+                <p className="broker-note">
+                  После подключения перезапусти Codex и оставляй Switcher
+                  запущенным: broker работает внутри приложения.
+                </p>
+              </div>
+
               <div className="settings-section">
                 <div className="section-copy">
                   <Cookie size={18} />
@@ -530,9 +717,14 @@ function AccountDetails({
   error,
   active,
   loading,
+  detailsLoading,
   activating,
+  refreshingToken,
+  token,
+  live,
   onClose,
   onRefresh,
+  onRefreshToken,
   onActivate,
 }: {
   profile: Profile;
@@ -540,9 +732,14 @@ function AccountDetails({
   error?: string;
   active: boolean;
   loading: boolean;
+  detailsLoading: boolean;
   activating: boolean;
+  refreshingToken: boolean;
+  token?: TokenStatus;
+  live?: AccountLiveInfo;
   onClose: () => void;
   onRefresh: () => void;
+  onRefreshToken: () => void;
   onActivate: () => void;
 }) {
   return (
@@ -570,7 +767,11 @@ function AccountDetails({
               {active ? "Активен в Codex" : error || "Готов к переключению"}
             </b>
             <small>
-              {rate?.planType?.toUpperCase() || "Тариф не определён"}
+              {(
+                live?.livePlan ||
+                token?.planType ||
+                rate?.planType
+              )?.toUpperCase() || "Тариф не определён"}
             </small>
           </div>
         </div>
@@ -580,7 +781,94 @@ function AccountDetails({
           <DetailUsage title="Недельный лимит" window={rate?.secondary} />
         </div>
 
+        <div className="token-health">
+          <span className="token-icon">
+            <KeyRound size={17} />
+          </span>
+          <div>
+            <b>Access token</b>
+            <small>
+              {token
+                ? token.accessSecondsLeft > 0
+                  ? `Живёт ещё ${formatLifetime(token.accessSecondsLeft)}`
+                  : "Срок действия истёк"
+                : detailsLoading
+                  ? "Читаю JWT…"
+                  : "Срок неизвестен"}
+            </small>
+          </div>
+          <span className={`refresh-state ${token?.hasRefresh ? "ok" : ""}`}>
+            {token?.hasRefresh ? "REFRESH ЕСТЬ" : "НЕТ REFRESH"}
+          </span>
+          <button
+            className="ghost compact-action"
+            disabled={refreshingToken || !token?.hasRefresh}
+            onClick={onRefreshToken}
+          >
+            {refreshingToken ? (
+              <LoaderCircle className="spin" size={14} />
+            ) : (
+              <RefreshCw size={14} />
+            )}
+            Продлить
+          </button>
+        </div>
+
+        <div className="live-facts">
+          <div>
+            <Globe2 size={15} />
+            <span>
+              <small>Страна счёта</small>
+              <b>
+                {live?.country || "—"}
+                {live?.currency ? ` · ${live.currency}` : ""}
+              </b>
+            </span>
+          </div>
+          <div>
+            <CalendarClock size={15} />
+            <span>
+              <small>Подписка до</small>
+              <b>{token?.subscriptionUntil || "—"}</b>
+            </span>
+          </div>
+          <div>
+            <CreditCard size={15} />
+            <span>
+              <small>Способы оплаты</small>
+              <b>{live ? live.paymentMethods.length : "—"}</b>
+            </span>
+          </div>
+        </div>
+
+        {!!live?.paymentMethods.length && (
+          <div className="payment-list">
+            {live.paymentMethods.map((method, index) => (
+              <div key={`${method.label}-${method.last4 || index}`}>
+                <CreditCard size={14} />
+                <b>{method.label}</b>
+                <span>
+                  {method.last4 ? `···${method.last4}` : method.handle || ""}
+                  {method.expires ? ` · до ${method.expires}` : ""}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!!live?.warnings.length && (
+          <div className="detail-warnings">
+            {live.warnings.map((warning) => (
+              <span key={warning}>{warning}</span>
+            ))}
+          </div>
+        )}
+
         <dl className="account-meta">
+          <div>
+            <dt>Последний refresh</dt>
+            <dd>{token?.lastRefresh ? formatDate(token.lastRefresh) : "—"}</dd>
+          </div>
           <div>
             <dt>Добавлен</dt>
             <dd>{formatDate(profile.createdAt)}</dd>
@@ -653,6 +941,12 @@ function DetailUsage({
 function formatDate(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("ru-RU");
+}
+
+function formatLifetime(seconds: number) {
+  if (seconds <= 0) return "0 ч";
+  const hours = Math.ceil(seconds / 3600);
+  return hours >= 48 ? `${Math.round(hours / 24)} дн.` : `${hours} ч`;
 }
 
 function formatReset(timestamp: number) {

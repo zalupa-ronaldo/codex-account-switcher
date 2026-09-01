@@ -1,10 +1,10 @@
 {
   "name": "codex-account-switcher",
   "private": true,
-  "version": "2.1.2",
+  "version": "2.2.1",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --port 1420 --strictPort",
     "build": "tsc && vite build",
     "tauri": "tauri"
   },
